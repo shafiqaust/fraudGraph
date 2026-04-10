@@ -1,131 +1,46 @@
 """
 services/explanation.py
 -----------------------
-Converts triggered rules + scores into analyst-grade reasoning text.
-
-Each explanation has three parts:
-  1. Intro line  — risk level verdict
-  2. Rule bullets — what was detected and why it matters
-  3. Tail lines   — ML score context + amount context + path pattern
+Generates plain-English explanations for each scored transaction.
 """
 
-# ── Per-rule plain-English sentences ─────────────────────────────────────────
-RULE_SENTENCES: dict[str, str] = {
-    "high_amount": (
-        "This is a high-value transaction well above the normal threshold "
-        "({amount}), which is a common characteristic of large-scale fraud."
-    ),
-    "risky_type": (
-        "The transaction type ({type}) is one of the two categories where "
-        "virtually all PaySim fraud occurs: TRANSFER and CASH_OUT."
-    ),
-    "balance_drain": (
-        "The source account was completely emptied — its balance went from "
-        "{old_bal} to $0.00. This 'zero-out' pattern is a strong indicator "
-        "of fraudulent fund extraction."
-    ),
-    "dest_zero_to_large": (
-        "The destination account had a zero balance before this transaction "
-        "and received a large inflow ({new_dest}). This matches the profile "
-        "of a mule account receiving stolen funds."
-    ),
-    "system_flagged": (
-        "This transaction was independently flagged by the automated "
-        "isFlaggedFraud filter, corroborating the risk signals above."
-    ),
-    "balance_mismatch": (
-        "The arithmetic does not add up: the source balance change "
-        "({old_bal} - {new_bal}) does not equal the stated amount ({amount}). "
-        "This discrepancy suggests data manipulation or a split transaction."
-    ),
+import pandas as pd
+
+RULE_ENGLISH = {
+    "high_amount":        "Transaction amount is unusually large",
+    "risky_type":         "Transaction type is high-risk (Transfer or Cash Out)",
+    "balance_drain":      "Sender account was fully emptied",
+    "dest_zero_to_large": "Receiver account jumped from zero to a large balance",
+    "system_flagged":     "Transaction was flagged by the bank system",
+    "balance_mismatch":   "Account balance change does not match the transaction amount",
 }
 
-INTRO: dict[str, str] = {
-    "High":   "HIGH RISK — This transaction exhibits multiple strong fraud indicators.",
-    "Medium": "MEDIUM RISK — This transaction shows suspicious characteristics worth reviewing.",
-    "Low":    "LOW RISK — This transaction appears within normal parameters.",
-}
+def explain(row: pd.Series, score_result: dict) -> str:
+    parts = []
+    risk  = score_result.get("risk_level", "Low")
+    final = score_result.get("risk_score", 0.0)
+    ml    = score_result.get("ml_score",   0.0)
+    rules = score_result.get("triggered_rules", [])
 
-FRAUD_PATHS: dict[tuple, str] = {
-    ("TRANSFER",):           "Matches a common fraud pathway: large TRANSFER to an external account.",
-    ("CASH_OUT",):           "Matches a common fraud pathway: CASH_OUT to drain accumulated funds.",
-    ("TRANSFER", "CASH_OUT"): "Matches the classic fraud chain: TRANSFER followed by CASH_OUT exit.",
-}
+    parts.append(f"Risk level: {risk} ({final*100:.0f}% probability).")
 
-
-def _fmt_amount(val) -> str:
-    try:
-        return f"${float(val):,.2f}"
-    except Exception:
-        return str(val)
-
-
-def generate_explanation(
-    row: dict,
-    triggered_rules: list[dict],
-    level: str,
-    ml_score: float,
-) -> str:
-    lines: list[str] = []
-
-    lines.append(INTRO.get(level, ""))
-    lines.append("")
-
-    if not triggered_rules:
-        lines.append("No significant fraud signals detected. Transaction appears normal.")
-        return "\n".join(lines)
-
-    lines.append("Signals detected:")
-    for rule in triggered_rules:
-        template = RULE_SENTENCES.get(rule["id"], rule["label"])
-        sentence = template.format(
-            amount   = _fmt_amount(row.get("amount",         0)),
-            type     = str(row.get("type", "UNKNOWN")),
-            old_bal  = _fmt_amount(row.get("oldbalanceOrg",  0)),
-            new_bal  = _fmt_amount(row.get("newbalanceOrig", 0)),
-            new_dest = _fmt_amount(row.get("newbalanceDest", 0)),
-        )
-        lines.append(f"  • {sentence}")
-
-    lines.append("")
-
-    tx_type = str(row.get("type", ""))
-    for key_types, path_text in FRAUD_PATHS.items():
-        if tx_type in key_types:
-            lines.append(f"Pattern: {path_text}")
-            break
-
-    if ml_score > 0.55:
-        lines.append(
-            f"ML anomaly score: {ml_score:.2f} — "
-            "Isolation Forest identified this as a statistical outlier "
-            "relative to the transaction population."
-        )
+    if rules:
+        labels = [RULE_ENGLISH.get(r["id"], r.get("label", r["id"])) for r in rules]
+        parts.append("Triggered rules: " + "; ".join(labels) + ".")
     else:
-        lines.append(
-            f"ML anomaly score: {ml_score:.2f} — "
-            "Within normal statistical range; risk is primarily rule-driven."
-        )
+        parts.append("No symbolic rules triggered.")
+
+    if ml >= 0.6:
+        parts.append("The ML model flagged this transaction as statistically anomalous.")
+    elif ml >= 0.4:
+        parts.append("The ML model detected mild anomalies in this transaction.")
+    else:
+        parts.append("The ML model found no strong anomaly signal.")
 
     amount = float(row.get("amount", 0))
-    if amount > 1_000_000:
-        lines.append(
-            f"Amount {_fmt_amount(amount)} places this in the top 1% "
-            "of all transactions in the dataset."
-        )
+    if amount > 500_000:
+        parts.append(f"The transaction amount (${amount:,.0f}) is extremely large.")
     elif amount > 200_000:
-        lines.append(
-            f"Amount {_fmt_amount(amount)} exceeds the high-value threshold."
-        )
+        parts.append(f"The transaction amount (${amount:,.0f}) exceeds the high-value threshold.")
 
-    return "\n".join(lines)
-
-
-def generate_mapf_explanation(conflicts: list[str]) -> str:
-    """Format MAPF conflict list into a readable block."""
-    if not conflicts:
-        return ""
-    lines = ["MAPF Conflict Analysis — temporal path overlaps detected:"]
-    for conflict in conflicts:
-        lines.append(f"  • {conflict}")
-    return "\n".join(lines)
+    return " ".join(parts)

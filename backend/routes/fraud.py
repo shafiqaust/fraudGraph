@@ -1,151 +1,140 @@
 """
 routes/fraud.py
 ---------------
-All FraudGraph API endpoints.
-
-GET /api/health              — liveness check
-GET /api/stats               — dataset + scoring summary
-GET /api/transactions        — paginated + filtered transaction list
-GET /api/transaction/{tx_id} — single transaction detail
-GET /api/graph               — entity subgraph (GNN + MAPF)
+All API endpoints for the FraudGraph AI dashboard.
 """
 
-from fastapi import APIRouter, Query, HTTPException
+from __future__ import annotations
+from functools import lru_cache
 from typing import Optional
 
-from services.data_loader  import load_data, get_dataset_stats
-from services.rules_engine import evaluate_rules
-from services.scoring      import score_row, combined_score, risk_level, train_model, is_trained
-from services.explanation  import generate_explanation, generate_mapf_explanation
+from fastapi import APIRouter, HTTPException, Query
+
+from services.data_loader  import load_data
+from services.scoring      import combined_score, train_model, is_trained
+from services.explanation  import explain
 from services.graph_engine import build_graph_for_entity
 
 router = APIRouter()
 
-# ── In-memory scored cache ────────────────────────────────────────────────────
-_scored_cache: Optional[list[dict]] = None
-
+# ── one-time scoring cache ────────────────────────────────────────
+_scored_cache: list[dict] | None = None
 
 def _get_scored() -> list[dict]:
-    """Score all transactions once; return cached results on subsequent calls."""
     global _scored_cache
-
     if _scored_cache is not None:
         return _scored_cache
 
     df = load_data()
 
+    # train model on first call
     if not is_trained():
         train_model(df)
 
-    results = []
-    for _, row in df.iterrows():
-        r           = row.to_dict()
-        rule_result = evaluate_rules(r)
-        ml          = score_row(r)
-        score       = combined_score(ml, rule_result["rule_score"])
-        level       = risk_level(score)
-        explanation = generate_explanation(r, rule_result["triggered_rules"], level, ml)
-
-        results.append({
-            **{k: r[k] for k in [
-                "tx_id", "step", "type", "amount",
-                "nameOrig", "nameDest",
-                "oldbalanceOrg", "newbalanceOrig",
-                "oldbalanceDest", "newbalanceDest",
-                "isFraud", "isFlaggedFraud",
-            ]},
-            "ml_score":       round(ml, 4),
-            "rule_score":     round(rule_result["rule_score"], 4),
-            "risk_score":     round(score, 4),
-            "risk_level":     level,
-            "triggered_rules": rule_result["triggered_rules"],
-            "explanation":    explanation,
+    rows = []
+    for _, r in df.iterrows():
+        result = combined_score(r)          # takes one row, returns full dict
+        rows.append({
+            "tx_id":           str(r.get("tx_id", "")),
+            "step":            int(r.get("step", 0)),
+            "type":            str(r.get("type", "")),
+            "amount":          float(r.get("amount", 0)),
+            "nameOrig":        str(r.get("nameOrig", "")),
+            "nameDest":        str(r.get("nameDest", "")),
+            "oldbalanceOrg":   float(r.get("oldbalanceOrg", 0)),
+            "newbalanceOrig":  float(r.get("newbalanceOrig", 0)),
+            "oldbalanceDest":  float(r.get("oldbalanceDest", 0)),
+            "newbalanceDest":  float(r.get("newbalanceDest", 0)),
+            "isFraud":         int(r.get("isFraud", 0)),
+            "isFlaggedFraud":  int(r.get("isFlaggedFraud", 0)),
+            "ml_score":        result["ml_score"],
+            "rule_score":      result["rule_score"],
+            "risk_score":      result["risk_score"],
+            "risk_level":      result["risk_level"],
+            "triggered_rules": result["triggered_rules"],
+            "explanation":     explain(r, result),
         })
 
-    _scored_cache = results
-    return results
+    _scored_cache = rows
+    return rows
 
 
-# ── Endpoints ─────────────────────────────────────────────────────────────────
-
-@router.get("/health", tags=["system"])
+# ── GET /api/health ───────────────────────────────────────────────
+@router.get("/health")
 def health():
     return {"status": "ok", "service": "FraudGraph AI", "model_ready": is_trained()}
 
 
-@router.get("/stats", tags=["system"])
+# ── GET /api/stats ────────────────────────────────────────────────
+@router.get("/stats")
 def stats():
-    base   = get_dataset_stats()
     scored = _get_scored()
-    counts = {"High": 0, "Medium": 0, "Low": 0}
+    total  = len(scored)
+    fraud  = sum(1 for r in scored if r["isFraud"] == 1)
+    flagged= sum(1 for r in scored if r["isFlaggedFraud"] == 1)
+    high   = sum(1 for r in scored if r["risk_level"] == "High")
+    medium = sum(1 for r in scored if r["risk_level"] == "Medium")
+    low    = sum(1 for r in scored if r["risk_level"] == "Low")
+    amounts= [r["amount"] for r in scored]
+    type_counts: dict[str, int] = {}
     for r in scored:
-        counts[r["risk_level"]] = counts.get(r["risk_level"], 0) + 1
+        type_counts[r["type"]] = type_counts.get(r["type"], 0) + 1
+
     return {
-        **base,
-        "high_risk_count":   counts["High"],
-        "medium_risk_count": counts["Medium"],
-        "low_risk_count":    counts["Low"],
+        "total_rows":        total,
+        "fraud_count":       fraud,
+        "flagged_count":     flagged,
+        "high_risk_count":   high,
+        "medium_risk_count": medium,
+        "low_risk_count":    low,
+        "type_counts":       type_counts,
+        "total_amount":      round(sum(amounts), 2),
+        "avg_amount":        round(sum(amounts) / total if total else 0, 2),
+        "max_amount":        round(max(amounts) if amounts else 0, 2),
     }
 
 
-@router.get("/transactions", tags=["fraud"])
+# ── GET /api/transactions ─────────────────────────────────────────
+@router.get("/transactions")
 def transactions(
-    limit:        int            = Query(500, ge=1,  le=3200),
-    offset:       int            = Query(0,   ge=0),
-    risk_level_f: Optional[str]  = Query(None, alias="risk_level"),
-    tx_type:      Optional[str]  = Query(None),
-    min_amount:   Optional[float]= Query(None),
-    sort_by:      str            = Query("risk_score"),
-    order:        str            = Query("desc"),
+    risk_level: Optional[str] = None,
+    tx_type:    Optional[str] = None,
+    min_amount: Optional[float] = None,
+    limit:      int = 500,
+    sort_by:    str = "risk_score",
 ):
     scored = _get_scored()
+    rows   = list(scored)
 
-    # ── Filters ───────────────────────────────────────────────────────────────
-    if risk_level_f:
-        scored = [r for r in scored if r["risk_level"] == risk_level_f]
+    if risk_level:
+        rows = [r for r in rows if r["risk_level"].lower() == risk_level.lower()]
     if tx_type:
-        scored = [r for r in scored if r["type"] == tx_type.upper()]
+        rows = [r for r in rows if r["type"].lower() == tx_type.lower()]
     if min_amount is not None:
-        scored = [r for r in scored if r["amount"] >= min_amount]
+        rows = [r for r in rows if r["amount"] >= min_amount]
 
-    # ── Sort ──────────────────────────────────────────────────────────────────
-    reverse = (order == "desc")
-    tier_order = {"High": 0, "Medium": 1, "Low": 2}
+    reverse = sort_by in ("risk_score", "amount", "ml_score", "rule_score")
+    rows.sort(key=lambda r: r.get(sort_by, 0), reverse=reverse)
 
-    if sort_by == "risk_score":
-        scored = sorted(
-            scored,
-            key=lambda r: (tier_order.get(r["risk_level"], 3), -r["risk_score"]),
-        )
-    elif sort_by == "amount":
-        scored = sorted(scored, key=lambda r: r["amount"], reverse=reverse)
-    elif sort_by == "step":
-        scored = sorted(scored, key=lambda r: r["step"], reverse=reverse)
-
-    total = len(scored)
-    return {
-        "transactions": scored[offset : offset + limit],
-        "total":        total,
-        "offset":       offset,
-        "limit":        limit,
-    }
+    return {"transactions": rows[:limit], "total": len(rows)}
 
 
-@router.get("/transaction/{tx_id}", tags=["fraud"])
-def transaction_detail(tx_id: str):
+# ── GET /api/transaction/{tx_id} ──────────────────────────────────
+@router.get("/transaction/{tx_id}")
+def transaction(tx_id: str):
     scored = _get_scored()
-    match  = next((r for r in scored if str(r.get("tx_id")) == tx_id), None)
-    if not match:
-        raise HTTPException(status_code=404, detail=f"Transaction '{tx_id}' not found")
-    return match
+    for r in scored:
+        if r["tx_id"] == tx_id:
+            return r
+    raise HTTPException(status_code=404, detail="Transaction not found")
 
 
-@router.get("/graph", tags=["fraud"])
+# ── GET /api/graph ────────────────────────────────────────────────
+@router.get("/graph")
 def graph(
-    entity_id: str = Query(..., description="Account or merchant ID to centre the graph on"),
-    depth:     int = Query(2,   ge=1, le=3,  description="Hop depth for graph traversal"),
+    entity_id: str,
+    depth:     int = Query(default=2, ge=1, le=3),
 ):
     df     = load_data()
-    result = build_graph_for_entity(df, entity_id, depth=depth)
-    result["mapf_explanation"] = generate_mapf_explanation(result["mapf_conflicts"])
+    result = build_graph_for_entity(df, entity_id, depth)
     return result
