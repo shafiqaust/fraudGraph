@@ -54,26 +54,15 @@ def risk_level(score: float) -> str:
     return 'High' if score >= 0.65 else 'Medium' if score >= 0.35 else 'Low'
 
 def combined_score(row: pd.Series) -> dict:
-    ml     = score_row(row)
-    raw    = evaluate_rules(row)
+    ml       = score_row(row)
+    raw      = evaluate_rules(row)
 
-    # Normalise: evaluate_rules may return list of dicts OR list of strings
-    triggered  = []
-    rule_score = 0.0
-
-    for item in raw:
-        if isinstance(item, dict):
-            # format: {"id": "...", "label": "...", "weight": 0.x, "triggered": True/False}
-            if item.get("triggered", False):
-                rule_score += float(item.get("weight", 0.2))
-                triggered.append({"id": item.get("id",""), "label": item.get("label",""), "weight": float(item.get("weight",0.2))})
-        elif isinstance(item, str):
-            # format: just a rule id string meaning it fired
-            rule_score += 0.2
-            triggered.append({"id": item, "label": item, "weight": 0.2})
-
+    # evaluate_rules returns {"triggered_rules": [...], "rule_score": float}
+    triggered  = raw.get("triggered_rules", [])
+    rule_score = float(raw.get("rule_score", 0.0))
     rule_score = min(rule_score, 1.0)
-    final      = min(0.4 * ml + 0.6 * rule_score, 1.0)
+
+    final = min(0.4 * ml + 0.6 * rule_score, 1.0)
 
     return {
         'ml_score':        round(ml,         4),
