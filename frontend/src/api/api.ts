@@ -61,11 +61,36 @@ export interface GraphEdge {
   is_fraud: number
 }
 
+export interface MAPFStepContext {
+  step:      number
+  from:      string
+  to:        string
+  type:      string
+  amount:    number
+  isFraud:   number
+  highlight: 'competitor' | 'center' | 'fraud' | 'normal'
+}
+
+export interface MAPFConflictDetail {
+  competitor_account:  string
+  center_account:      string
+  destination:         string
+  tx_type:             string
+  competitor_amount:   number
+  competitor_step:     number
+  center_step:         number
+  step_difference:     number
+  window:              number
+  step_context:        MAPFStepContext[]
+  competitor_is_fraud: number
+}
+
 export interface GraphResponse {
   center:           string
   nodes:            GraphNode[]
   edges:            GraphEdge[]
   mapf_conflicts:   string[]
+  mapf_details:     MAPFConflictDetail[]
   mapf_explanation: string
   stats: {
     node_count:     number

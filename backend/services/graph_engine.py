@@ -1,88 +1,98 @@
 """
 services/graph_engine.py
 ------------------------
-Graph Engine combining two AI concepts:
-
-GNN-inspired risk propagation
-    Risk(node) = base_risk + 0.3 × Σ(neighbour_risk × edge_weight)
-    One message-passing iteration over the local subgraph.
-
-MAPF-inspired conflict detection
-    Flags accounts that follow the same transaction-type sequence
-    to the same destination within a configurable time window (steps).
-    Analogous to path conflicts in Multi-Agent Path Finding.
+Graph Engine — GNN-inspired risk propagation + MAPF conflict detection.
 """
 
 from collections import defaultdict
 from typing import Optional
 import pandas as pd
 
-# ── Config ────────────────────────────────────────────────────────────────────
-MAX_NODES         = 60    # cap before trimming low-risk nodes
-MAX_EDGES         = 200   # cap on edges returned to frontend
-GRAPH_DEPTH       = 2     # default hop depth
-MAPF_WINDOW       = 5     # step window for MAPF conflict detection
-MAX_MAPF_RESULTS  = 5     # cap on conflicts returned
-PROPAGATION_ALPHA = 0.30  # outgoing risk propagation weight
-PROPAGATION_BETA  = 0.10  # incoming (reverse) propagation weight
+MAX_NODES         = 60
+MAX_EDGES         = 200
+DEFAULT_DEPTH     = 2
+MAPF_WINDOW       = 5
+MAX_MAPF          = 5
+PROPAGATION_ALPHA = 0.30
+PROPAGATION_BETA  = 0.10
+AMOUNT_SCALE      = 1_000_000.0
 
-
-# =============================================================================
-# Public API
-# =============================================================================
 
 def build_graph_for_entity(
-    df: pd.DataFrame,
+    df:        pd.DataFrame,
     entity_id: str,
-    depth: int = GRAPH_DEPTH,
+    depth:     int = DEFAULT_DEPTH,
 ) -> dict:
-    """
-    Build a subgraph centred on entity_id up to `depth` hops.
-    Applies GNN-like risk propagation and MAPF conflict detection.
+    base_risks             = _compute_base_risks(df)
+    nodes, edges           = _bfs_subgraph(df, entity_id, depth, base_risks)
+    nodes                  = _propagate_risk(nodes, edges)
+    conflicts, conflict_steps = _detect_mapf_conflicts_with_steps(df, entity_id)
 
-    Returns a dict ready to be serialised as JSON for the frontend.
-    """
-    base_risks = _compute_base_risks(df)
-    nodes, edges = _bfs_subgraph(df, entity_id, depth, base_risks)
-    nodes = _propagate_risk(nodes, edges)
-    conflicts = _detect_mapf_conflicts(df, entity_id)
-
-    # Trim oversized graphs
     node_list = list(nodes.values())
     if len(node_list) > MAX_NODES:
         node_list.sort(key=lambda n: -n["propagated_risk"])
         keep_ids  = {n["id"] for n in node_list[:MAX_NODES]} | {entity_id}
         node_list = [n for n in node_list if n["id"] in keep_ids]
-        edges     = [e for e in edges if e["source"] in keep_ids and e["target"] in keep_ids]
+        edges     = [
+            e for e in edges
+            if e["source"] in keep_ids and e["target"] in keep_ids
+        ]
+
+    edge_list = edges[:MAX_EDGES]
 
     return {
-        "center":           entity_id,
-        "nodes":            node_list,
-        "edges":            edges[:MAX_EDGES],
-        "mapf_conflicts":   conflicts,
+        "center":          entity_id,
+        "nodes":           node_list,
+        "edges":           edge_list,
+        "mapf_conflicts":  conflicts,
+        "mapf_details":    conflict_steps,
         "stats": {
             "node_count":     len(node_list),
-            "edge_count":     min(len(edges), MAX_EDGES),
+            "edge_count":     len(edge_list),
             "conflict_count": len(conflicts),
         },
     }
 
 
-# =============================================================================
-# Internal — subgraph construction
-# =============================================================================
+def _compute_base_risks(df: pd.DataFrame) -> dict:
+    risks: dict = defaultdict(float)
+
+    for _, row in df.iterrows():
+        src      = str(row["nameOrig"])
+        dst      = str(row["nameDest"])
+        amount   = float(row["amount"])
+        is_fraud = int(row.get("isFraud",        0))
+        tx_type  = str(row.get("type",           ""))
+        new_src  = float(row.get("newbalanceOrig", 1))
+        old_src  = float(row.get("oldbalanceOrg",  0))
+        old_dst  = float(row.get("oldbalanceDest", 1))
+        new_dst  = float(row.get("newbalanceDest", 0))
+
+        src_delta = 0.0
+        if is_fraud:                              src_delta += 0.80
+        if tx_type in ("TRANSFER", "CASH_OUT"):   src_delta += 0.20
+        if amount > 200_000:                      src_delta += 0.15
+        if new_src == 0.0 and old_src > 0.0:      src_delta += 0.30
+        risks[src] = min(risks[src] + src_delta * 0.30, 1.0)
+
+        dst_delta = 0.0
+        if is_fraud:                              dst_delta += 0.50
+        if old_dst == 0.0 and new_dst > 500_000: dst_delta += 0.40
+        risks[dst] = min(risks[dst] + dst_delta * 0.30, 1.0)
+
+    return dict(risks)
+
 
 def _bfs_subgraph(
-    df: pd.DataFrame,
-    start: str,
-    depth: int,
+    df:         pd.DataFrame,
+    start:      str,
+    depth:      int,
     base_risks: dict,
-) -> tuple[dict, list]:
-    """BFS traversal to collect nodes and edges within `depth` hops."""
-    nodes:   dict[str, dict] = {}
-    edges:   list[dict]      = []
-    visited: set[str]        = set()
-    queue:   list[tuple]     = [(start, 0)]
+) -> tuple:
+    nodes:   dict = {}
+    edges:   list = []
+    visited: set  = set()
+    queue:   list = [(start, 0)]
 
     while queue:
         current, level = queue.pop(0)
@@ -90,115 +100,46 @@ def _bfs_subgraph(
             continue
         visited.add(current)
 
+        risk = base_risks.get(current, 0.0)
         nodes[current] = {
-            "id":             current,
-            "label":          current,
-            "type":           _node_type(current),
-            "base_risk":      round(base_risks.get(current, 0.0), 4),
-            "propagated_risk": round(base_risks.get(current, 0.0), 4),
-            "level":          level,
+            "id":              current,
+            "label":           current,
+            "type":            _node_type(current),
+            "base_risk":       round(risk, 4),
+            "propagated_risk": round(risk, 4),
+            "level":           level,
         }
 
-        # Outgoing (current is sender)
         for _, row in df[df["nameOrig"] == current].iterrows():
-            dst        = row["nameDest"]
-            edge_weight = min(float(row["amount"]) / 1_000_000.0, 1.0)
-            _add_edge(edges, current, dst, row, edge_weight)
+            dst = str(row["nameDest"])
+            _append_edge(edges, current, dst, row)
             if dst not in visited and level + 1 <= depth:
                 queue.append((dst, level + 1))
 
-        # Incoming (current is receiver)
         for _, row in df[df["nameDest"] == current].iterrows():
-            src        = row["nameOrig"]
-            edge_weight = min(float(row["amount"]) / 1_000_000.0, 1.0)
-            _add_edge(edges, src, current, row, edge_weight)
+            src = str(row["nameOrig"])
+            _append_edge(edges, src, current, row)
             if src not in visited and level + 1 <= depth:
                 queue.append((src, level + 1))
 
     return nodes, edges
 
 
-def _add_edge(
-    edges: list,
-    source: str,
-    target: str,
-    row,
-    weight: float,
-) -> None:
-    """Append an edge only if an identical source→target pair does not exist."""
-    duplicate = any(
-        e["source"] == source and e["target"] == target
-        for e in edges
-    )
-    if not duplicate:
-        edges.append({
-            "source":   source,
-            "target":   target,
-            "amount":   round(float(row["amount"]), 2),
-            "type":     str(row.get("type", "")),
-            "tx_id":    str(row.get("tx_id", "")),
-            "weight":   round(weight, 4),
-            "is_fraud": int(row.get("isFraud", 0)),
-        })
+def _append_edge(edges: list, source: str, target: str, row) -> None:
+    if any(e["source"] == source and e["target"] == target for e in edges):
+        return
+    edges.append({
+        "source":   source,
+        "target":   target,
+        "amount":   round(float(row["amount"]), 2),
+        "type":     str(row.get("type", "")),
+        "tx_id":    str(row.get("tx_id", "")),
+        "weight":   round(min(float(row["amount"]) / AMOUNT_SCALE, 1.0), 4),
+        "is_fraud": int(row.get("isFraud", 0)),
+    })
 
-
-# =============================================================================
-# Internal — base risk computation
-# =============================================================================
-
-def _compute_base_risks(df: pd.DataFrame) -> dict[str, float]:
-    """
-    Compute a base risk score for every entity that appears in the dataset.
-    This is the 'prior' before GNN propagation runs.
-    """
-    risks: dict[str, float] = defaultdict(float)
-
-    for _, row in df.iterrows():
-        src      = str(row["nameOrig"])
-        dst      = str(row["nameDest"])
-        amount   = float(row["amount"])
-        is_fraud = int(row.get("isFraud", 0))
-        tx_type  = str(row.get("type", ""))
-
-        # ── Source node risk ──────────────────────────────────────────────────
-        src_score = 0.0
-        if is_fraud:
-            src_score += 0.80
-        if tx_type in ("TRANSFER", "CASH_OUT"):
-            src_score += 0.20
-        if amount > 200_000:
-            src_score += 0.15
-        if (float(row.get("newbalanceOrig", 1)) == 0.0
-                and float(row.get("oldbalanceOrg", 0)) > 0):
-            src_score += 0.30
-        risks[src] = min(risks[src] + src_score * 0.30, 1.0)
-
-        # ── Destination node risk ─────────────────────────────────────────────
-        dst_score = 0.0
-        if is_fraud:
-            dst_score += 0.50
-        if (float(row.get("oldbalanceDest", 1)) == 0.0
-                and float(row.get("newbalanceDest", 0)) > 500_000):
-            dst_score += 0.40
-        risks[dst] = min(risks[dst] + dst_score * 0.30, 1.0)
-
-    return dict(risks)
-
-
-# =============================================================================
-# Internal — GNN-like risk propagation
-# =============================================================================
 
 def _propagate_risk(nodes: dict, edges: list) -> dict:
-    """
-    One message-passing iteration (approximates GNN behaviour).
-
-    For each directed edge source → target:
-      target_risk += ALPHA × source_risk × edge_weight
-      source_risk += BETA  × target_risk × edge_weight  (reverse signal)
-
-    Scores are capped at 1.0.
-    """
     propagated = {nid: n["base_risk"] for nid, n in nodes.items()}
 
     for edge in edges:
@@ -218,58 +159,107 @@ def _propagate_risk(nodes: dict, edges: list) -> dict:
             )
 
     for nid in nodes:
-        nodes[nid]["propagated_risk"] = round(propagated.get(nid, nodes[nid]["base_risk"]), 4)
+        nodes[nid]["propagated_risk"] = round(
+            propagated.get(nid, nodes[nid]["base_risk"]),
+            4,
+        )
 
     return nodes
 
 
-# =============================================================================
-# Internal — MAPF conflict detection
-# =============================================================================
-
-def _detect_mapf_conflicts(df: pd.DataFrame, entity_id: str) -> list[str]:
-    """
-    MAPF-inspired temporal path conflict detection.
-
-    A conflict is raised when a different account sends the same
-    transaction type to the same destination as entity_id within
-    MAPF_WINDOW steps — signalling coordinated (multi-agent) behaviour.
-    """
-    conflicts: list[str] = []
+def _detect_mapf_conflicts_with_steps(
+    df: pd.DataFrame,
+    entity_id: str,
+) -> tuple:
+    conflicts:      list = []
+    conflict_steps: list = []
 
     entity_txs = df[
         (df["nameOrig"] == entity_id) | (df["nameDest"] == entity_id)
     ]
     if entity_txs.empty:
-        return conflicts
+        return conflicts, conflict_steps
 
     for _, tx in entity_txs.iterrows():
-        step1 = int(tx.get("step", 0))
-        dest  = str(tx["nameDest"])
+        step1   = int(tx.get("step", 0))
+        dest    = str(tx["nameDest"])
+        tx_type = str(tx.get("type", ""))
 
         competitors = df[
             (df["nameDest"]  == dest)
             & (df["nameOrig"] != entity_id)
+            & (df["type"]     == tx_type)
             & (abs(df["step"] - step1) <= MAPF_WINDOW)
-            & (df["type"] == tx.get("type"))
         ]
 
         for _, comp in competitors.iterrows():
-            conflicts.append(
+            comp_step = int(comp["step"])
+
+            window_start = max(1, comp_step - MAPF_WINDOW)
+            window_end   = comp_step + MAPF_WINDOW
+            window_rows  = df[
+                (df["step"] >= window_start) & (df["step"] <= window_end)
+            ].sort_values("step")
+
+            step_context = []
+            for _, wr in window_rows.iterrows():
+                is_competitor_tx = (
+                    str(wr["nameOrig"]) == str(comp["nameOrig"])
+                    and str(wr["nameDest"]) == dest
+                    and int(wr["step"]) == comp_step
+                )
+                is_center_tx = (
+                    str(wr["nameOrig"]) == entity_id
+                    and str(wr["nameDest"]) == dest
+                )
+                is_fraud_tx = int(wr.get("isFraud", 0)) == 1
+
+                step_context.append({
+                    "step":      int(wr["step"]),
+                    "from":      str(wr["nameOrig"]),
+                    "to":        str(wr["nameDest"]),
+                    "type":      str(wr["type"]),
+                    "amount":    round(float(wr["amount"]), 2),
+                    "isFraud":   int(wr.get("isFraud", 0)),
+                    "highlight": "competitor" if is_competitor_tx else
+                                 "center"     if is_center_tx     else
+                                 "fraud"      if is_fraud_tx       else
+                                 "normal",
+                })
+
+            center_tx_to_dest = df[
+                (df["nameOrig"] == entity_id) & (df["nameDest"] == dest)
+            ]
+            center_step = int(center_tx_to_dest.iloc[0]["step"]) \
+                if not center_tx_to_dest.empty else step1
+
+            conflict_msg = (
                 f"Account {comp['nameOrig']} sent a {comp['type']} of "
                 f"${float(comp['amount']):,.0f} to the same destination "
                 f"({dest}) within {MAPF_WINDOW} steps — "
                 "possible coordinated fraud path."
             )
-            if len(conflicts) >= MAX_MAPF_RESULTS:
-                return conflicts
+            conflicts.append(conflict_msg)
 
-    return conflicts[:MAX_MAPF_RESULTS]
+            conflict_steps.append({
+                "competitor_account":  str(comp["nameOrig"]),
+                "center_account":      entity_id,
+                "destination":         dest,
+                "tx_type":             tx_type,
+                "competitor_amount":   round(float(comp["amount"]), 2),
+                "competitor_step":     comp_step,
+                "center_step":         center_step,
+                "step_difference":     abs(comp_step - center_step),
+                "window":              MAPF_WINDOW,
+                "step_context":        step_context,
+                "competitor_is_fraud": int(comp.get("isFraud", 0)),
+            })
 
+            if len(conflicts) >= MAX_MAPF:
+                return conflicts, conflict_steps
 
-# =============================================================================
-# Internal — helpers
-# =============================================================================
+    return conflicts[:MAX_MAPF], conflict_steps[:MAX_MAPF]
+
 
 def _node_type(entity_id: str) -> str:
     if entity_id.startswith("C"):
